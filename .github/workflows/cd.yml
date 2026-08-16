@@ -1,0 +1,216 @@
+name: cd
+
+# Despliega directo a Azure (sin pasar por Terraform ni su gate de
+# aprobación) al destino que esté en 0% en el backend pool ponderado de
+# APIM, y avanza la rampa 5% -> 25% -> 100% con ventanas de observación
+# y guardrail de error rate. ADR-01/ADR-02/ADR-03 en novapay-iac-terraform
+# documentan el diseño completo; los comentarios de este archivo solo
+# explican el "cómo", no el "por qué".
+#
+# Rollback manual: workflow_dispatch con el tag del release anterior —
+# reusa exactamente el mismo mecanismo de destino/despliegue, no un
+# camino aparte.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag a redesplegar (rollback manual). Vacío = usar el tag del evento release."
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  attestations: write
+
+concurrency:
+  group: deploy-novapay-functions-prod
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: rg-novapay-prod
+  APIM_NAME: apim-novapay-prod
+  POOL_NAME: pool-novapay-pagos-prod
+  APPINSIGHTS_NAME: appi-novapay-prod
+  FUNC_ESTABLE: func-novapay-pagos-prod
+  FUNC_CANARY: func-novapay-pagos-canary-prod
+  BACKEND_ESTABLE: func-novapay-pagos-backend
+  BACKEND_CANARY: func-novapay-pagos-canary-backend
+  API_VERSION: "2024-05-01"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: src/NovaPay.Payments
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: dotnet publish
+        run: dotnet publish --configuration Release --output ./publish
+
+      - name: Empaquetar artefacto de despliegue
+        working-directory: src/NovaPay.Payments/publish
+        run: zip -r ../../../deploy.zip .
+
+      - name: Atestación de procedencia del artefacto
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: deploy.zip
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Consultar pesos actuales del backend pool y elegir destino
+        id: target
+        run: |
+          set -euo pipefail
+          pool=$(az rest --method get \
+            --uri "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/backends/$POOL_NAME?api-version=$API_VERSION")
+
+          w_estable=$(echo "$pool" | jq -r --arg b "$BACKEND_ESTABLE" '.properties.pool.services[] | select(.id | endswith("/backends/" + $b)) | .weight')
+          w_canary=$(echo "$pool" | jq -r --arg b "$BACKEND_CANARY" '.properties.pool.services[] | select(.id | endswith("/backends/" + $b)) | .weight')
+
+          echo "Peso estable=$w_estable candidata=$w_canary"
+
+          # Guardia de estado ambiguo: ninguna instancia limpiamente en
+          # 0% es señal de un ciclo anterior interrumpido a mitad de
+          # rampa. Se aborta y se alerta (falla el job) en vez de asumir
+          # un destino.
+          if [ "$w_estable" = "0" ]; then
+            echo "target_app=$FUNC_ESTABLE" >> "$GITHUB_OUTPUT"
+            echo "target_backend=$BACKEND_ESTABLE" >> "$GITHUB_OUTPUT"
+            echo "other_backend=$BACKEND_CANARY" >> "$GITHUB_OUTPUT"
+          elif [ "$w_canary" = "0" ]; then
+            echo "target_app=$FUNC_CANARY" >> "$GITHUB_OUTPUT"
+            echo "target_backend=$BACKEND_CANARY" >> "$GITHUB_OUTPUT"
+            echo "other_backend=$BACKEND_ESTABLE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Estado ambiguo del backend pool (estable=$w_estable, candidata=$w_canary) — ninguna instancia está limpiamente en 0%. Posible ciclo anterior interrumpido. Abortando sin desplegar."
+            exit 1
+          fi
+
+      - name: Desplegar en la instancia en 0%
+        run: |
+          set -euo pipefail
+          az functionapp deployment source config-zip \
+            --src ../../deploy.zip \
+            --name "${{ steps.target.outputs.target_app }}" \
+            --resource-group "$RESOURCE_GROUP"
+
+      - name: Verificación post-despliegue vía Application Insights
+        # Exclusivamente vía Application Insights — nunca una invocación
+        # HTTP directa del runner, que quedaría bloqueada por
+        # ip_restriction (ADR-08). Espera hasta 10 minutos a ver al
+        # menos una solicitud exitosa y ninguna excepción de la
+        # instancia recién desplegada; si el estado queda incierto, no
+        # se avanza ningún peso.
+        run: |
+          set -euo pipefail
+          app_id=$(az monitor app-insights component show --app "$APPINSIGHTS_NAME" -g "$RESOURCE_GROUP" --query appId -o tsv)
+          deadline=$((SECONDS + 600))
+          role="${{ steps.target.outputs.target_app }}"
+
+          while [ $SECONDS -lt $deadline ]; do
+            requests=$(az monitor app-insights query --app "$app_id" \
+              --analytics-query "requests | where timestamp > ago(10m) and cloud_RoleName == '$role' and success == true | count" \
+              --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+            exceptions=$(az monitor app-insights query --app "$app_id" \
+              --analytics-query "exceptions | where timestamp > ago(10m) and cloud_RoleName == '$role' | count" \
+              --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+
+            echo "Solicitudes exitosas=$requests excepciones=$exceptions"
+
+            if [ "${exceptions:-0}" != "0" ]; then
+              echo "::error::Excepciones detectadas en $role tras el despliegue — no se avanza ningún peso."
+              exit 1
+            fi
+            if [ "${requests:-0}" != "0" ]; then
+              echo "Verificación post-despliegue OK."
+              exit 0
+            fi
+            sleep 30
+          done
+
+          echo "::error::No se observó ninguna solicitud exitosa de $role en 10 minutos — estado incierto, no se avanza ningún peso."
+          exit 1
+
+      - name: Rampa de canary 5% -> 25% -> 100%
+        run: |
+          set -euo pipefail
+          app_id=$(az monitor app-insights component show --app "$APPINSIGHTS_NAME" -g "$RESOURCE_GROUP" --query appId -o tsv)
+          target_backend="${{ steps.target.outputs.target_backend }}"
+          other_backend="${{ steps.target.outputs.other_backend }}"
+          role="${{ steps.target.outputs.target_app }}"
+
+          set_weights () {
+            local target_weight=$1
+            local other_weight=$2
+            az rest --method patch \
+              --uri "https://management.azure.com/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/backends/$POOL_NAME?api-version=$API_VERSION" \
+              --body "{\"properties\":{\"pool\":{\"services\":[{\"id\":\"/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/backends/$target_backend\",\"weight\":$target_weight},{\"id\":\"/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/backends/$other_backend\",\"weight\":$other_weight}]}}}"
+          }
+
+          # Ventana mínima antes de cada incremento: al menos 15 minutos
+          # Y al menos 50 solicitudes observadas (ambas, no una u otra —
+          # sin esto se podría avanzar sobre una muestra estadísticamente
+          # insuficiente en tráfico bajo, o esperar de más si el tráfico
+          # es alto). Aborta y hace rollback de tráfico (peso a 0) si el
+          # error rate supera 3% en cualquier chequeo.
+          observe_and_guard () {
+            local step_start=$SECONDS
+            while true; do
+              sleep 120
+              elapsed=$((SECONDS - step_start))
+              total=$(az monitor app-insights query --app "$app_id" \
+                --analytics-query "requests | where timestamp > ago($(( (elapsed + 59) / 60 ))m) and cloud_RoleName == '$role' | count" \
+                --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+              failed=$(az monitor app-insights query --app "$app_id" \
+                --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$role' and success == false | count" \
+                --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+              recent=$(az monitor app-insights query --app "$app_id" \
+                --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$role' | count" \
+                --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+
+              if [ "${recent:-0}" -gt 0 ]; then
+                error_pct=$(( (failed * 100) / recent ))
+                if [ "$error_pct" -gt 3 ]; then
+                  echo "::error::Error rate ${error_pct}% (>3%) en $role — rollback de tráfico a 0% y abortando la rampa."
+                  set_weights 0 100
+                  exit 1
+                fi
+              fi
+
+              if [ "$elapsed" -ge 900 ] && [ "${total:-0}" -ge 50 ]; then
+                echo "Ventana de observación cumplida: ${elapsed}s, ${total} solicitudes."
+                return 0
+              fi
+              echo "Esperando ventana de observación: ${elapsed}s / 900s, ${total:-0} / 50 solicitudes."
+            done
+          }
+
+          echo "Rampa a 5%"
+          set_weights 5 95
+          observe_and_guard
+
+          echo "Rampa a 25%"
+          set_weights 25 75
+          observe_and_guard
+
+          echo "Rampa a 100%"
+          set_weights 100 0
+          echo "Promoción completa: $role al 100%."
