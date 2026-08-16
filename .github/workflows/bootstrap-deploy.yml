@@ -37,6 +37,9 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Ver cd.yml: sin esto el subject claim del token OIDC no coincide
+    # con el federated credential (repo:.../environment:production).
+    environment: production
     timeout-minutes: 15
     defaults:
       run:

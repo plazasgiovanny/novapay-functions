@@ -44,6 +44,11 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Sin esto, el subject claim del token OIDC es "ref:refs/heads/<rama>",
+    # no "environment:production" — no coincide con el federated
+    # credential creado en Entra ID (repo:.../environment:production) y
+    # el login falla con AADSTS700213.
+    environment: production
     timeout-minutes: 90
     defaults:
       run:
