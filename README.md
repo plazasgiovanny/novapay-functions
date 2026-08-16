@@ -19,4 +19,5 @@ Terraform gestiona el *shell* del recurso (runtime, integración VNet, identidad
 ## CI/CD
 
 - **CI** (`.github/workflows/ci.yml`, en cada PR): `dotnet build` con SDK fijada a `net8.0`.
-- **CD**: pendiente — depende de que el backend pool ponderado de APIM (Sección 2, ADR-03) exista en `novapay-iac-terraform` antes de poder consultar su peso y decidir el destino del despliegue (ver ADR-02). Se agrega en cuanto esa infraestructura esté lista.
+- **CD** (`.github/workflows/cd.yml`, en cada release publicado): consulta el peso actual del backend pool de APIM para elegir la instancia en 0% (aborta si el estado es ambiguo), despliega ahí (`az functionapp deployment source config-zip`), atesta la procedencia del artefacto, verifica el despliegue exclusivamente vía Application Insights, y avanza la rampa 5% → 25% → 100% con ventana de observación (≥15 min y ≥50 solicitudes) y guardrail de error rate (rollback de tráfico automático si supera 3%). Rollback manual: `workflow_dispatch` con el tag del release anterior — mismo mecanismo, no un camino aparte.
+- Identidad OIDC propia (`sp-novapay-functions-prod`), con `Website Contributor` sobre ambos Function Apps y `API Management Service Contributor` acotado a `apim-novapay-prod` (necesario porque el propio CD mueve los pesos del pool) — nunca sobre el resource group completo.
