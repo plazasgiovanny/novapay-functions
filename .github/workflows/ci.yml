@@ -1,0 +1,39 @@
+name: ci
+
+# Valida el build en cada Pull Request hacia main: restore + build con la
+# SDK fijada (net8.0). No hay pruebas unitarias todavía en este proyecto —
+# brecha reconocida, no oculta (ver README). Empaquetado del artefacto de
+# despliegue se hace en el pipeline de CD, no aquí.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-novapay-functions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: src/NovaPay.Payments
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: dotnet restore
+        run: dotnet restore
+
+      - name: dotnet build
+        run: dotnet build --no-restore --configuration Release
