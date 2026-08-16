@@ -1,0 +1,72 @@
+name: bootstrap-deploy
+
+# Herramienta de "break-glass": despliega directo a UNA instancia
+# puntual, sin consultar ni tocar el peso del backend pool de APIM.
+#
+# Uso real: sembrar código por primera vez en un Function App recién
+# creado por Terraform (host key data source no responde hasta que el
+# runtime tiene código real — ver ADR-01 en novapay-iac-terraform), o
+# recuperar una instancia manualmente si el pipeline de CD normal
+# (cd.yml) no es aplicable. No reemplaza a cd.yml para el ciclo normal
+# de despliegue — ese es el único que gestiona la rampa y el estado del
+# Pool.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Nombre exacto del Function App destino"
+        required: true
+        type: choice
+        options:
+          - func-novapay-pagos-prod
+          - func-novapay-pagos-canary-prod
+      tag:
+        description: "Tag/ref a desplegar (default: rama por defecto)"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: bootstrap-deploy-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: src/NovaPay.Payments
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: dotnet publish
+        run: dotnet publish --configuration Release --output ./publish
+
+      - name: Empaquetar
+        working-directory: src/NovaPay.Payments/publish
+        run: zip -r ../../../deploy.zip .
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Desplegar
+        run: |
+          set -euo pipefail
+          az functionapp deployment source config-zip \
+            --src ../../deploy.zip \
+            --name "${{ inputs.target }}" \
+            --resource-group rg-novapay-prod
