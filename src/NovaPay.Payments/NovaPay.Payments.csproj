@@ -15,7 +15,7 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="1.17.4" OutputItemType="Analyzer" />
 
     <!-- Bindings: HTTP trigger (ValidatePayment) y Service Bus (ProcessPayment / evento PaymentValidated) -->
-    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http" Version="3.2.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http" Version="3.3.0" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.ServiceBus" Version="5.17.0" />
 
     <!-- Application Insights (APPLICATIONINSIGHTS_CONNECTION_STRING ya inyectado por Terraform) -->
