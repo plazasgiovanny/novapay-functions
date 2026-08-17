@@ -24,7 +24,7 @@
 
     <!-- Azure SQL vía identidad administrada (Authentication=Active Directory Default), sin cadenas de conexión con contraseña -->
     <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />
-    <PackageReference Include="Azure.Identity" Version="1.17.0" />
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
   </ItemGroup>
 
   <ItemGroup>
