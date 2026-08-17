@@ -19,7 +19,7 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.ServiceBus" Version="5.17.0" />
 
     <!-- Application Insights (APPLICATIONINSIGHTS_CONNECTION_STRING ya inyectado por Terraform) -->
-    <PackageReference Include="Microsoft.ApplicationInsights.WorkerService" Version="2.23.0" />
+    <PackageReference Include="Microsoft.ApplicationInsights.WorkerService" Version="3.1.2" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.ApplicationInsights" Version="2.50.0" />
 
     <!-- Azure SQL vía identidad administrada (Authentication=Active Directory Default), sin cadenas de conexión con contraseña -->
