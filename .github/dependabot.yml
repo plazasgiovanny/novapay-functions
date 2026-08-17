@@ -1,0 +1,22 @@
+# Bloque 3.3 U4 (ADR-08): mantenimiento automático de dependencias.
+# Dependabot solo abre el PR con la actualización -- el merge lo revisa
+# y aprueba una persona (ver flujo de PR del repo). Sin auto-merge.
+
+version: 2
+updates:
+  # Dependencias NuGet del único proyecto de código (.csproj) del repo.
+  - package-ecosystem: "nuget"
+    directory: "/src/NovaPay.Payments"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # Actions usadas en los workflows de .github/workflows/*.yml
+  # (ci.yml, cd.yml, bootstrap-deploy.yml, codeql.yml). El directorio
+  # "/" es el repo raíz -- Dependabot detecta los workflows solo, no
+  # hace falta apuntar a .github/workflows explícitamente.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
