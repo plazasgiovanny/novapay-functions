@@ -1,0 +1,78 @@
+name: codeql
+
+# Bloque 3.3 U4 (ADR-08): advanced setup de CodeQL con queries
+# security-extended explicitas -- el "default setup" del portal
+# (Settings > Code security) no permite elegir el query suite, por
+# eso hace falta este workflow propio en vez del boton de un click.
+#
+# Analiza csharp: el unico lenguaje de codigo real del repo (el
+# worker de Azure Functions en src/NovaPay.Payments). "actions" no se
+# declara como lenguaje de analisis aparte -- los workflows de
+# .github/workflows ya se cubren via actionlint y Dependabot
+# (ecosystem github-actions para las versiones), y csharp es el
+# codigo que efectivamente procesa datos de pagos.
+#
+# Build mode "manual": el SDK esta fijada a net8.0 (misma convencion
+# que ci.yml/cd.yml), asi que un build explicito con
+# actions/setup-dotnet + dotnet build es mas confiable que
+# "autobuild", que adivina el toolchain.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Lunes 06:00 UTC: cd.yml se dispara por evento de release, no
+    # por horario, asi que no hay ventana de deploy con la que
+    # coordinar. Se elige el inicio de la semana laboral para que una
+    # vulnerabilidad nueva (query pack actualizado por GitHub, o CVE
+    # publicado) se detecte aunque esa semana no haya push ni PR.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  # Minimo real documentado por github/codeql-action (README del
+  # action y el workflow starter oficial de GitHub para "CodeQL
+  # Advanced"): security-events:write para subir resultados a Code
+  # Scanning (requerido siempre), packages:read para resolver query
+  # packs privados/internos, actions:read y contents:read porque este
+  # es un repo privado.
+  security-events: write
+  packages: read
+  actions: read
+  contents: read
+
+concurrency:
+  group: codeql-novapay-functions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (csharp)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: csharp
+          build-mode: manual
+          queries: security-extended
+
+      - name: dotnet build (trazado por CodeQL)
+        working-directory: src/NovaPay.Payments
+        run: |
+          dotnet restore
+          dotnet build --no-restore --configuration Release
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:csharp"
