@@ -33,6 +33,7 @@ concurrency:
 env:
   RESOURCE_GROUP: rg-novapay-prod
   APIM_NAME: apim-novapay-prod
+  APIM_GATEWAY_URL: https://apim-novapay-prod.azure-api.net
   POOL_NAME: pool-novapay-pagos-prod
   APPINSIGHTS_NAME: appi-novapay-prod
   FUNC_ESTABLE: func-novapay-pagos-prod
@@ -46,6 +47,13 @@ env:
   # repo, no valores fijos aquí (el immutable_id lo genera Azure).
   DCE_LOGS_INGESTION_ENDPOINT: ${{ secrets.DCE_LOGS_INGESTION_ENDPOINT }}
   DCR_PESOACTUALIZADO_IMMUTABLE_ID: ${{ secrets.DCR_PESOACTUALIZADO_IMMUTABLE_ID }}
+  # Ruta directa de verificación en APIM (bypassa el backend pool
+  # ponderado — ver HALLAZGO REAL en el step de verificación, más
+  # abajo). APIM_VERIFY_KEY: salida sensible apim_verify_key de
+  # novapay-iac-terraform. APIM_SUBSCRIPTION_KEY: la misma subscription
+  # key ya usada para tráfico real contra el gateway.
+  APIM_VERIFY_KEY: ${{ secrets.APIM_VERIFY_KEY }}
+  APIM_SUBSCRIPTION_KEY: ${{ secrets.APIM_SUBSCRIPTION_KEY }}
 
 jobs:
   deploy:
@@ -123,42 +131,71 @@ jobs:
             --name "${{ steps.target.outputs.target_app }}" \
             --resource-group "$RESOURCE_GROUP"
 
-      - name: Verificación post-despliegue vía Application Insights
-        # Exclusivamente vía Application Insights — nunca una invocación
-        # HTTP directa del runner, que quedaría bloqueada por
-        # ip_restriction (ADR-08). Espera hasta 10 minutos a ver al
-        # menos una solicitud exitosa y ninguna excepción de la
-        # instancia recién desplegada; si el estado queda incierto, no
-        # se avanza ningún peso.
+      - name: Verificación post-despliegue vía ruta directa en APIM
+        # HALLAZGO REAL (primer run real de este pipeline, 2026-08-17 —
+        # nunca antes ejercitado: bootstrap-deploy.yml, el único camino
+        # usado hasta ahora para desplegar código, no tiene ningún paso
+        # de verificación): la versión anterior de este step esperaba
+        # tráfico real en la instancia recién desplegada vía Application
+        # Insights, pero esa instancia SIEMPRE está al 0% de peso justo
+        # después del deploy (es, por definición, la que se va a
+        # promover) — con weight=0 el backend pool nunca la selecciona
+        # para tráfico público. Confirmado empíricamente: 10 solicitudes
+        # reales vía scripts/load-generator.sh (novapay-iac-terraform),
+        # 0 llegaron a la instancia en 0%. La verificación no podía
+        # pasar nunca tal como estaba diseñada.
+        #
+        # Fix real: la policy de APIM (novapay-iac-terraform,
+        # modules/api-management) tiene una ruta directa condicional que
+        # bypassa el Pool SOLO si llegan dos headers (uno con el secreto
+        # APIM_VERIFY_KEY, otro con el backend-id exacto a alcanzar) —
+        # sigue pasando por ip_restriction porque el origen real de la
+        # solicitud sigue siendo APIM (mismo service tag ya permitido),
+        # a diferencia de una invocación HTTP directa del runner contra
+        # el Function App, que sí quedaría bloqueada (ADR-08).
         run: |
           set -euo pipefail
           app_id=$(az monitor app-insights component show --app "$APPINSIGHTS_NAME" -g "$RESOURCE_GROUP" --query appId -o tsv)
-          deadline=$((SECONDS + 600))
           role="${{ steps.target.outputs.target_app }}"
+          target_backend="${{ steps.target.outputs.target_backend }}"
 
-          while [ $SECONDS -lt $deadline ]; do
-            requests=$(az monitor app-insights query --app "$app_id" \
-              --analytics-query "requests | where timestamp > ago(10m) and cloud_RoleName == '$role' and success == true | count" \
-              --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
-            exceptions=$(az monitor app-insights query --app "$app_id" \
-              --analytics-query "exceptions | where timestamp > ago(10m) and cloud_RoleName == '$role' | count" \
-              --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
-
-            echo "Solicitudes exitosas=$requests excepciones=$exceptions"
-
-            if [ "${exceptions:-0}" != "0" ]; then
-              echo "::error::Excepciones detectadas en $role tras el despliegue — no se avanza ningún peso."
-              exit 1
+          fail_count=0
+          for i in 1 2 3; do
+            transaction_id=$(openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')
+            body=$(printf '{"TransactionId":"%s","SourceAccount":"ACC-VERIFY-01","DestinationAccount":"ACC-VERIFY-02","Amount":1000,"Currency":"COP"}' "$transaction_id")
+            http_code=$(curl -sS --max-time 30 -o /tmp/verify_resp.json -w "%{http_code}" \
+              -X POST "${APIM_GATEWAY_URL}/api/v1/payments/confirmations" \
+              -H "Content-Type: application/json" \
+              -H "Ocp-Apim-Subscription-Key: $APIM_SUBSCRIPTION_KEY" \
+              -H "X-Novapay-Verify-Key: $APIM_VERIFY_KEY" \
+              -H "X-Novapay-Verify-Target: $target_backend" \
+              -d "$body" || echo "000")
+            echo "Verificación directa $i/3 contra $target_backend: http=$http_code"
+            if [ "$http_code" != "202" ]; then
+              fail_count=$((fail_count + 1))
+              cat /tmp/verify_resp.json || true
             fi
-            if [ "${requests:-0}" != "0" ]; then
-              echo "Verificación post-despliegue OK."
-              exit 0
-            fi
-            sleep 30
+            sleep 5
           done
 
-          echo "::error::No se observó ninguna solicitud exitosa de $role en 10 minutos — estado incierto, no se avanza ningún peso."
-          exit 1
+          if [ "$fail_count" -gt 0 ]; then
+            echo "::error::$fail_count de 3 solicitudes de verificación directa fallaron contra $role — no se avanza ningún peso."
+            exit 1
+          fi
+
+          # Ventana corta para que la telemetría de las solicitudes de
+          # arriba llegue a Application Insights antes de consultar
+          # excepciones.
+          sleep 60
+          exceptions=$(az monitor app-insights query --app "$app_id" \
+            --analytics-query "exceptions | where timestamp > ago(5m) and cloud_RoleName == '$role' | count" \
+            --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+          if [ "${exceptions:-0}" != "0" ]; then
+            echo "::error::Excepciones detectadas en $role tras el despliegue — no se avanza ningún peso."
+            exit 1
+          fi
+
+          echo "Verificación post-despliegue OK (3/3 solicitudes directas exitosas, sin excepciones)."
 
       - name: Rampa de canary 5% -> 25% -> 100%
         run: |
