@@ -91,7 +91,7 @@ jobs:
         run: zip -r ../../../deploy.zip .
 
       - name: Atestación de procedencia del artefacto
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: deploy.zip
 
