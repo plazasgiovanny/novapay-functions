@@ -73,6 +73,23 @@ check_burn_rate_not_blocking () {
 # Ventana mínima antes de avanzar: al menos 15 minutos Y al menos 50
 # solicitudes observadas (ambas, no una u otra). Aborta y hace rollback
 # de tráfico (peso a 0) si el error rate supera 3% en cualquier chequeo.
+#
+# HALLAZGO REAL (auditoría de rigor arquitectónico, 2026-08-17): este
+# guardrail solo miraba success == false (excepciones no controladas /
+# 5xx) — ciego a una regresión de negocio real, la más probable en un
+# despliegue de código: un bug que empiece a devolver 400 en masa para
+# solicitudes que antes eran válidas. ValidatePayment maneja esos casos
+# sin lanzar excepción, así que success queda en true sin importar el
+# código HTTP (ver PLAN.md §3.5) — el guardrail nunca lo detectaba.
+#
+# Fix real: comparar la tasa de 400 del rol en rampa contra la del otro
+# rol en la MISMA ventana, no un umbral absoluto — ambos reciben la
+# misma mezcla real de tráfico (válido/inválido), así que una diferencia
+# grande entre las dos tasas señala una regresión propia del código
+# nuevo, no ruido de datos de cliente inválidos que ya existía antes del
+# despliegue. Umbral: 10 puntos porcentuales de diferencia, con un piso
+# mínimo de 3 solicitudes rechazadas para no disparar sobre muestras
+# chicas.
 observe_and_guard () {
   local step_start=$SECONDS
   while true; do
@@ -87,11 +104,31 @@ observe_and_guard () {
     recent=$(az monitor app-insights query --app "$APP_ID" \
       --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' | count" \
       --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+    rechazadas=$(az monitor app-insights query --app "$APP_ID" \
+      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' and resultCode == '400' | count" \
+      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+    recent_otro=$(az monitor app-insights query --app "$APP_ID" \
+      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$OTHER_ROLE' | count" \
+      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+    rechazadas_otro=$(az monitor app-insights query --app "$APP_ID" \
+      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$OTHER_ROLE' and resultCode == '400' | count" \
+      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
 
     if [ "${recent:-0}" -gt 0 ]; then
       error_pct=$(( (failed * 100) / recent ))
       if [ "$error_pct" -gt 3 ]; then
         echo "::error::Error rate ${error_pct}% (>3%) en $ROLE — rollback de tráfico a 0% y abortando la rampa."
+        set_weights 0 100
+        exit 1
+      fi
+    fi
+
+    if [ "${recent:-0}" -gt 0 ] && [ "${recent_otro:-0}" -gt 0 ] && [ "${rechazadas:-0}" -ge 3 ]; then
+      tasa_rechazo=$(( (rechazadas * 100) / recent ))
+      tasa_rechazo_otro=$(( (rechazadas_otro * 100) / recent_otro ))
+      diff_rechazo=$((tasa_rechazo - tasa_rechazo_otro))
+      if [ "$diff_rechazo" -gt 10 ]; then
+        echo "::error::Tasa de rechazo (400) ${tasa_rechazo}% en $ROLE vs ${tasa_rechazo_otro}% en $OTHER_ROLE (misma ventana, misma mezcla de tráfico) — posible regresión de negocio en el código nuevo. Rollback de tráfico a 0% y abortando la rampa."
         set_weights 0 100
         exit 1
       fi
