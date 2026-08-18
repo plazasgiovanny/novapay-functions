@@ -35,7 +35,7 @@ env:
   # Usados por .github/scripts/ramp-step.sh para re-autenticar vía OIDC
   # directo si una consulta a Application Insights falla a mitad de un
   # tramo (ver HALLAZGO REAL 2026-08-18 en ese script) — el mismo
-  # client-id/tenant-id que azure/login@v2 ya recibe abajo como `with:`.
+  # client-id/tenant-id que azure/login@v3 ya recibe abajo como `with:`.
   AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
   AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   RESOURCE_GROUP: rg-novapay-prod
@@ -95,7 +95,7 @@ jobs:
         with:
           subject-path: deploy.zip
 
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -231,7 +231,7 @@ jobs:
       # un reintento del mismo problema. Lógica compartida extraída a
       # .github/scripts/ramp-step.sh (no se puede reutilizar una función
       # de bash entre steps distintos, cada uno arranca un shell nuevo).
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -240,7 +240,7 @@ jobs:
       - name: Rampa a 5%
         run: bash "$GITHUB_WORKSPACE/.github/scripts/ramp-step.sh" 5 95
 
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -249,7 +249,7 @@ jobs:
       - name: Rampa a 25%
         run: bash "$GITHUB_WORKSPACE/.github/scripts/ramp-step.sh" 25 75
 
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
