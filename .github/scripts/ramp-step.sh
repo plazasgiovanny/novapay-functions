@@ -20,14 +20,78 @@
 # Variables de entorno esperadas (ya presentes como env de job/step en
 # cd.yml o exportadas a $GITHUB_ENV por el step "Preparar variables de
 # la rampa"): RESOURCE_GROUP, APIM_NAME, POOL_NAME, API_VERSION,
-# AZURE_SUBSCRIPTION_ID, APP_ID, ROLE, OTHER_ROLE, TARGET_BACKEND,
-# OTHER_BACKEND, DCE_LOGS_INGESTION_ENDPOINT (opcional),
+# AZURE_SUBSCRIPTION_ID, AZURE_CLIENT_ID, AZURE_TENANT_ID, APP_ID, ROLE,
+# OTHER_ROLE, TARGET_BACKEND, OTHER_BACKEND,
+# DCE_LOGS_INGESTION_ENDPOINT (opcional),
 # DCR_PESOACTUALIZADO_IMMUTABLE_ID (opcional).
+#
+# HALLAZGO REAL (2026-08-18, primera corrida real de este pipeline con
+# tráfico insuficiente — run 32179489191, sesión de demo en vivo del
+# pipeline a pedido del usuario): con tráfico orgánico bajo, un tramo al
+# 5% de peso puede tardar mucho más de lo normal en juntar 50
+# solicitudes reales en la instancia canary — el tramo llevaba ~1h
+# corriendo (el mismo orden de magnitud que la vida de un token AAD)
+# cuando el contador de observe_and_guard, que había llegado a 27/50,
+# volvió a 0 y se quedó ahí. Causa raíz: las 6 llamadas a
+# `az monitor app-insights query` de este archivo seguían el patrón
+# `... 2>/dev/null || echo 0` — eso trata CUALQUIER fallo del comando
+# (token expirado, throttling, red) exactamente igual que "la consulta
+# corrió bien y el resultado real es cero". Consecuencia doble: (1) el
+# step nunca cumple su condición de salida y se queda girando hasta el
+# timeout-minutes:90 del job, un fallo lento y opaco en vez de uno
+# rápido y claro; (2) peor, `failed`/`recent` (el guardrail de error
+# rate) también quedan en 0 con el mismo fallo — si un error real
+# ocurriera justo cuando el token expira, el guardrail quedaría ciego.
+# Fix: ai_query() de abajo distingue "el comando falló" de "el conteo
+# real es cero" (Kusto count() siempre devuelve una fila, así que un
+# cero genuino nunca pasa por la rama de fallo) — al fallar,
+# re-autentica vía OIDC directo (mismo mecanismo que azure/login@v2 por
+# dentro, pero invocable a mitad de un step de bash) y reintenta una
+# vez; si el reintento también falla, aborta con ::error:: explícito en
+# vez de seguir reportando ceros. Distinto del hallazgo que cerró PR
+# #16 (ese era el login expirando ENTRE tramos; este es el login
+# expirando DENTRO de un mismo tramo cuando dura más de lo esperado).
 set -euo pipefail
 
 target_weight=$1
 other_weight=$2
 observe="${3:-true}"
+
+azure_login_refresh () {
+  local id_token
+  id_token=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+    "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r '.value')
+  az login --service-principal \
+    -u "$AZURE_CLIENT_ID" \
+    --tenant "$AZURE_TENANT_ID" \
+    --federated-token "$id_token" \
+    --output none
+}
+
+# Ejecuta una consulta de Application Insights distinguiendo "el
+# comando az falló" de "el conteo real es cero" (ver HALLAZGO REAL
+# arriba). Un solo reintento tras re-autenticar; si vuelve a fallar,
+# aborta visiblemente en vez de reportar un cero fabricado.
+ai_query () {
+  local kql=$1
+  local out err_file
+  err_file=$(mktemp)
+  if out=$(az monitor app-insights query --app "$APP_ID" --analytics-query "$kql" --query "tables[0].rows[0][0]" -o tsv 2>"$err_file"); then
+    rm -f "$err_file"
+    echo "${out:-0}"
+    return 0
+  fi
+  echo "::warning::Consulta a Application Insights falló, reautenticando y reintentando: $(tail -1 "$err_file")"
+  azure_login_refresh
+  if out=$(az monitor app-insights query --app "$APP_ID" --analytics-query "$kql" --query "tables[0].rows[0][0]" -o tsv 2>"$err_file"); then
+    rm -f "$err_file"
+    echo "${out:-0}"
+    return 0
+  fi
+  echo "::error::Consulta a Application Insights falló dos veces seguidas, incluso tras reautenticar — abortando el tramo en vez de asumir 0 solicitudes silenciosamente. Detalle: $(tail -1 "$err_file")"
+  rm -f "$err_file"
+  exit 1
+}
 
 emit_peso_actualizado () {
   local instance=$1
@@ -60,9 +124,7 @@ set_weights () {
 # inmediato); este solo bloquea el SIGUIENTE incremento, sin rollback.
 check_burn_rate_not_blocking () {
   local pct
-  pct=$(az monitor app-insights query --app "$APP_ID" \
-    --analytics-query "requests | where timestamp > ago(30d) | summarize total=count(), errores=countif(success == false) | extend errorRate = errores * 100.0 / total | extend presupuestoConsumido = errorRate / 0.03 * 100 | project presupuestoConsumido" \
-    --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+  pct=$(ai_query "requests | where timestamp > ago(30d) | summarize total=count(), errores=countif(success == false) | extend errorRate = errores * 100.0 / total | extend presupuestoConsumido = errorRate / 0.03 * 100 | project presupuestoConsumido")
   echo "Consumo de error budget (ventana móvil 30 días): ${pct}%"
   if awk -v p="${pct:-0}" 'BEGIN { exit !(p+0 >= 80) }'; then
     echo "::error::Consumo de error budget >= 80% (${pct}%) — bloqueando el siguiente incremento de canary hasta que el presupuesto se recupere (ADR-07 §4.4). $ROLE se queda en el peso ya alcanzado, sin rollback."
@@ -95,24 +157,12 @@ observe_and_guard () {
   while true; do
     sleep 120
     elapsed=$((SECONDS - step_start))
-    total=$(az monitor app-insights query --app "$APP_ID" \
-      --analytics-query "requests | where timestamp > ago($(( (elapsed + 59) / 60 ))m) and cloud_RoleName == '$ROLE' | count" \
-      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
-    failed=$(az monitor app-insights query --app "$APP_ID" \
-      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' and success == false | count" \
-      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
-    recent=$(az monitor app-insights query --app "$APP_ID" \
-      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' | count" \
-      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
-    rechazadas=$(az monitor app-insights query --app "$APP_ID" \
-      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' and resultCode == '400' | count" \
-      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
-    recent_otro=$(az monitor app-insights query --app "$APP_ID" \
-      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$OTHER_ROLE' | count" \
-      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
-    rechazadas_otro=$(az monitor app-insights query --app "$APP_ID" \
-      --analytics-query "requests | where timestamp > ago(5m) and cloud_RoleName == '$OTHER_ROLE' and resultCode == '400' | count" \
-      --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+    total=$(ai_query "requests | where timestamp > ago($(( (elapsed + 59) / 60 ))m) and cloud_RoleName == '$ROLE' | count")
+    failed=$(ai_query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' and success == false | count")
+    recent=$(ai_query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' | count")
+    rechazadas=$(ai_query "requests | where timestamp > ago(5m) and cloud_RoleName == '$ROLE' and resultCode == '400' | count")
+    recent_otro=$(ai_query "requests | where timestamp > ago(5m) and cloud_RoleName == '$OTHER_ROLE' | count")
+    rechazadas_otro=$(ai_query "requests | where timestamp > ago(5m) and cloud_RoleName == '$OTHER_ROLE' and resultCode == '400' | count")
 
     if [ "${recent:-0}" -gt 0 ]; then
       error_pct=$(( (failed * 100) / recent ))

@@ -32,6 +32,12 @@ concurrency:
 
 env:
   AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  # Usados por .github/scripts/ramp-step.sh para re-autenticar vía OIDC
+  # directo si una consulta a Application Insights falla a mitad de un
+  # tramo (ver HALLAZGO REAL 2026-08-18 en ese script) — el mismo
+  # client-id/tenant-id que azure/login@v2 ya recibe abajo como `with:`.
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   RESOURCE_GROUP: rg-novapay-prod
   APIM_NAME: apim-novapay-prod
   APIM_GATEWAY_URL: https://apim-novapay-prod.azure-api.net
